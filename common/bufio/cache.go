@@ -3,6 +3,7 @@ package bufio
 import (
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 
 	"github.com/sagernet/sing/common/buf"
@@ -10,9 +11,11 @@ import (
 	N "github.com/sagernet/sing/common/network"
 )
 
+// The cached buffer is guarded by access: Close can run on another goroutine
+// while Read or WriteTo is draining it, and both used to release it.
 type CachedConn struct {
 	net.Conn
-	taken  atomic.Bool
+	access sync.Mutex
 	buffer *buf.Buffer
 }
 
@@ -24,40 +27,45 @@ func NewCachedConn(conn net.Conn, buffer *buf.Buffer) *CachedConn {
 	}
 }
 
-func (c *CachedConn) ReadCached() *buf.Buffer {
-	if !c.taken.CompareAndSwap(false, true) {
-		return nil
-	}
+func (c *CachedConn) takeBuffer() *buf.Buffer {
+	c.access.Lock()
 	buffer := c.buffer
 	c.buffer = nil
+	c.access.Unlock()
 	if buffer != nil {
 		buffer.DecRef()
 	}
 	return buffer
 }
 
+func (c *CachedConn) ReadCached() *buf.Buffer {
+	return c.takeBuffer()
+}
+
 func (c *CachedConn) Read(p []byte) (n int, err error) {
+	c.access.Lock()
 	if c.buffer != nil {
 		n, err = c.buffer.Read(p)
 		if err == nil {
+			c.access.Unlock()
 			return
 		}
 		c.buffer.DecRef()
 		c.buffer.Release()
 		c.buffer = nil
 	}
+	c.access.Unlock()
 	return c.Conn.Read(p)
 }
 
 func (c *CachedConn) WriteTo(w io.Writer) (n int64, err error) {
-	if c.buffer != nil {
-		wn, wErr := w.Write(c.buffer.Bytes())
-		if wErr != nil {
-			c.buffer.DecRef()
-			c.buffer.Release()
-			c.buffer = nil
-		}
+	if buffer := c.takeBuffer(); buffer != nil {
+		wn, wErr := w.Write(buffer.Bytes())
+		buffer.Release()
 		n += int64(wn)
+		if wErr != nil {
+			return n, wErr
+		}
 	}
 	cn, err := Copy(w, c.Conn)
 	n += cn
@@ -73,6 +81,8 @@ func (c *CachedConn) Upstream() any {
 }
 
 func (c *CachedConn) ReaderReplaceable() bool {
+	c.access.Lock()
+	defer c.access.Unlock()
 	return c.buffer == nil
 }
 
@@ -81,19 +91,13 @@ func (c *CachedConn) WriterReplaceable() bool {
 }
 
 func (c *CachedConn) Close() error {
-	if c.taken.CompareAndSwap(false, true) {
-		if buffer := c.buffer; buffer != nil {
-			c.buffer = nil
-			buffer.DecRef()
-			buffer.Release()
-		}
-	}
+	c.takeBuffer().Release()
 	return c.Conn.Close()
 }
 
 type CachedReader struct {
 	upstream io.Reader
-	taken    atomic.Bool
+	access   sync.Mutex
 	buffer   *buf.Buffer
 }
 
@@ -105,38 +109,45 @@ func NewCachedReader(upstream io.Reader, buffer *buf.Buffer) *CachedReader {
 	}
 }
 
-func (r *CachedReader) ReadCached() *buf.Buffer {
-	if !r.taken.CompareAndSwap(false, true) {
-		return nil
-	}
+func (r *CachedReader) takeBuffer() *buf.Buffer {
+	r.access.Lock()
 	buffer := r.buffer
 	r.buffer = nil
+	r.access.Unlock()
 	if buffer != nil {
 		buffer.DecRef()
 	}
 	return buffer
 }
 
+func (r *CachedReader) ReadCached() *buf.Buffer {
+	return r.takeBuffer()
+}
+
 func (r *CachedReader) Read(p []byte) (n int, err error) {
+	r.access.Lock()
 	if r.buffer != nil {
 		n, err = r.buffer.Read(p)
 		if err == nil {
+			r.access.Unlock()
 			return
 		}
 		r.buffer.DecRef()
 		r.buffer.Release()
 		r.buffer = nil
 	}
+	r.access.Unlock()
 	return r.upstream.Read(p)
 }
 
 func (r *CachedReader) WriteTo(w io.Writer) (n int64, err error) {
-	if r.buffer != nil {
-		wn, wErr := w.Write(r.buffer.Bytes())
-		if wErr != nil {
-			return 0, wErr
-		}
+	if buffer := r.takeBuffer(); buffer != nil {
+		wn, wErr := w.Write(buffer.Bytes())
+		buffer.Release()
 		n += int64(wn)
+		if wErr != nil {
+			return n, wErr
+		}
 	}
 	cn, err := Copy(w, r.upstream)
 	n += cn
@@ -148,17 +159,13 @@ func (r *CachedReader) Upstream() any {
 }
 
 func (r *CachedReader) ReaderReplaceable() bool {
+	r.access.Lock()
+	defer r.access.Unlock()
 	return r.buffer == nil
 }
 
 func (r *CachedReader) Close() error {
-	if r.taken.CompareAndSwap(false, true) {
-		if buffer := r.buffer; buffer != nil {
-			r.buffer = nil
-			buffer.DecRef()
-			buffer.Release()
-		}
-	}
+	r.takeBuffer().Release()
 	return nil
 }
 
